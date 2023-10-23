@@ -5,17 +5,38 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from diffusers.utils import deprecate, is_accelerate_available, logging, randn_tensor, replace_example_docstring
+from diffusers.utils import deprecate, is_accelerate_available, logging, replace_example_docstring
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
-
+from diffusers.pipelines.text_to_video_synthesis import TextToVideoSDPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-
+from diffusers.pipelines.text_to_video_synthesis import TextToVideoSDPipelineOutput
 from utils.gaussian_smoothing import GaussianSmoothing
 from utils.ptp_utils import AttentionStore, aggregate_attention
-
+from einops import rearrange
+import  utils.ptp_utils  as ptp_utils
+from PIL import Image
 logger = logging.get_logger(__name__)
 
-class BoxDiffPipeline(StableDiffusionPipeline):
+
+    
+def tensor2vid(video: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> List[np.ndarray]:
+    # This code is copied from https://github.com/modelscope/modelscope/blob/1509fdb973e5871f37148a4b5e5964cafd43e64d/modelscope/pipelines/multi_modal/text_to_video_synthesis_pipeline.py#L78
+    # reshape to ncfhw
+    mean = torch.tensor(mean, device=video.device).reshape(1, -1, 1, 1, 1)
+    std = torch.tensor(std, device=video.device).reshape(1, -1, 1, 1, 1)
+    # unnormalize back to [0,1]
+    video = video.mul_(std).add_(mean)
+    video.clamp_(0, 1)
+    # prepare the final outputs
+    i, c, f, h, w = video.shape
+    images = video.permute(2, 3, 0, 4, 1).reshape(
+        f, h, i * w, c
+    )  # 1st (frames, h, batch_size, w, c) 2nd (frames, h, batch_size * w, c)
+    images = images.unbind(dim=0)  # prepare a list of indvidual (consecutive frames)
+    images = [(image.cpu().numpy() * 255).astype("uint8") for image in images]  # f h w c
+    return images
+
+class BoxDiffPipeline(TextToVideoSDPipeline):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion.
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
@@ -41,7 +62,26 @@ class BoxDiffPipeline(StableDiffusionPipeline):
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
     _optional_components = ["safety_checker", "feature_extractor"]
-
+    
+    def save_cross_attention_vis(self, prompt, attention_maps, path):
+        tokens = self.tokenizer.encode(prompt)
+        images = []
+        attention_maps = attention_maps.cpu()
+        video_length = attention_maps.shape[0]
+        for frame_idx in range(video_length):
+            for i in range(len(tokens)):
+                image = attention_maps[frame_idx,:, :, i]
+                image = 255 * image / image.max()
+                image = image.unsqueeze(-1).expand(*image.shape, 3)
+                image = image.numpy().astype(np.uint8)
+                image = np.array(Image.fromarray(image).resize((256, 256)))
+                image = ptp_utils.text_under_image(
+                    image, self.tokenizer.decode(int(tokens[i]))
+                )
+                images.append(image)
+        vis = ptp_utils.view_images(np.stack(images, axis=0),num_rows=video_length)
+        vis.save(path)
+        
     def _encode_prompt(
         self,
         prompt,
@@ -92,7 +132,6 @@ class BoxDiffPipeline(StableDiffusionPipeline):
             )
             text_input_ids = text_inputs.input_ids
             untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
-
             if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
                 text_input_ids, untruncated_ids
             ):
@@ -108,7 +147,6 @@ class BoxDiffPipeline(StableDiffusionPipeline):
                 attention_mask = text_inputs.attention_mask.to(device)
             else:
                 attention_mask = None
-
             prompt_embeds = self.text_encoder(
                 text_input_ids.to(device),
                 attention_mask=attention_mask,
@@ -186,90 +224,116 @@ class BoxDiffPipeline(StableDiffusionPipeline):
                                          sigma: float = 0.5,
                                          kernel_size: int = 3,
                                          normalize_eot: bool = False,
-                                         bbox: List[int] = None,
+                                         bbox: List[List[int]] = None,
                                          config=None,
                                          ) -> List[torch.Tensor]:
         """ Computes the maximum attention value for each of the tokens we wish to alter. """
         last_idx = -1
+        #normalixe_eot=false
         if normalize_eot:
             prompt = self.prompt
             if isinstance(self.prompt, list):
                 prompt = self.prompt[0]
             last_idx = len(self.tokenizer(prompt)['input_ids']) - 1
-        attention_for_text = attention_maps[:, :, 1:last_idx]
-        attention_for_text *= 100
-        attention_for_text = torch.nn.functional.softmax(attention_for_text, dim=-1)
+        #attention_maps [2,16,16,77]，因为对于所有的attention_maps已经取过平均
+        # breakpoint()
+        attention_for_text_all = attention_maps[:,:, :, 1:last_idx]
+        attention_for_text_all *= 100
+        attention_for_text_all = torch.nn.functional.softmax(attention_for_text_all, dim=-1)
 
         # Shift indices since we removed the first token
         indices_to_alter = [index - 1 for index in indices_to_alter]
 
         # Extract the maximum values
-        max_indices_list_fg = []
-        max_indices_list_bg = []
-        dist_x = []
-        dist_y = []
+        max_indices_list_fg_all = []
+        max_indices_list_bg_all = []
+        dist_x_all = []
+        dist_y_all = []
 
         cnt = 0
-        for i in indices_to_alter:
-            image = attention_for_text[:, :, i]
+        for frame_idx in range(attention_for_text_all.shape[0]):
+            attention_for_text = attention_for_text_all[frame_idx]
+            max_indices_list_fg = []
+            max_indices_list_bg = []
+            dist_x = []
+            dist_y = []
+            for i in indices_to_alter:
+                image = attention_for_text[:, :, i]
+                #image.shape[0]=16
+                # print("cnt:", cnt, "frame_ids:", frame_idx, "len:", len(bbox))
+                #512->16 下采样32倍
+                box = [max(round(b / (self.res_height / image.shape[0])), 0) for b in bbox[cnt][frame_idx]]
+                x1, y1, x2, y2 = box
+                #由于bounding box定义不同需要添加如下代码
+                x2 = x1 + x2
+                y2 = y1 + y2
+                cnt += 1
+                cnt %= len(bbox)
 
-            box = [max(round(b / (512 / image.shape[0])), 0) for b in bbox[cnt]]
-            x1, y1, x2, y2 = box
-            cnt += 1
+                # coordinates to masks
+                obj_mask = torch.zeros_like(image)
+                ones_mask = torch.ones([y2 - y1, x2 - x1], dtype=obj_mask.dtype).to(obj_mask.device)
+                obj_mask[y1:y2, x1:x2] = ones_mask
+                bg_mask = 1 - obj_mask
 
-            # coordinates to masks
-            obj_mask = torch.zeros_like(image)
-            ones_mask = torch.ones([y2 - y1, x2 - x1], dtype=obj_mask.dtype).to(obj_mask.device)
-            obj_mask[y1:y2, x1:x2] = ones_mask
-            bg_mask = 1 - obj_mask
+                if smooth_attentions:
+                    smoothing = GaussianSmoothing(channels=1, kernel_size=kernel_size, sigma=sigma, dim=2).cuda()
+                    input = F.pad(image.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='reflect')
+                    image = smoothing(input).squeeze(0).squeeze(0)
 
-            if smooth_attentions:
-                smoothing = GaussianSmoothing(channels=1, kernel_size=kernel_size, sigma=sigma, dim=2).cuda()
-                input = F.pad(image.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='reflect')
-                image = smoothing(input).squeeze(0).squeeze(0)
+                # Inner-Box constraint
+                k = (obj_mask.sum() * config.P).long()
+                max_indices_list_fg.append((image * obj_mask).reshape(-1).topk(k)[0].mean())
 
-            # Inner-Box constraint
-            k = (obj_mask.sum() * config.P).long()
-            max_indices_list_fg.append((image * obj_mask).reshape(-1).topk(k)[0].mean())
+                # Outer-Box constraint
+                k = (bg_mask.sum() * config.P).long()
+                max_indices_list_bg.append((image * bg_mask).reshape(-1).topk(k)[0].mean())
 
-            # Outer-Box constraint
-            k = (bg_mask.sum() * config.P).long()
-            max_indices_list_bg.append((image * bg_mask).reshape(-1).topk(k)[0].mean())
+                # Corner Constraint
+                gt_proj_x = torch.max(obj_mask, dim=0)[0]
+                gt_proj_y = torch.max(obj_mask, dim=1)[0]
+                corner_mask_x = torch.zeros_like(gt_proj_x)
+                corner_mask_y = torch.zeros_like(gt_proj_y)
 
-            # Corner Constraint
-            gt_proj_x = torch.max(obj_mask, dim=0)[0]
-            gt_proj_y = torch.max(obj_mask, dim=1)[0]
-            corner_mask_x = torch.zeros_like(gt_proj_x)
-            corner_mask_y = torch.zeros_like(gt_proj_y)
+                # create gt according to the number config.L
+                N = gt_proj_x.shape[0]
+                corner_mask_x[max(box[0] - config.L, 0): min(box[0] + config.L + 1, N)] = 1.
+                corner_mask_x[max(box[2] - config.L, 0): min(box[2] + config.L + 1, N)] = 1.
+                corner_mask_y[max(box[1] - config.L, 0): min(box[1] + config.L + 1, N)] = 1.
+                corner_mask_y[max(box[3] - config.L, 0): min(box[3] + config.L + 1, N)] = 1.
+                dist_x.append((F.l1_loss(image.max(dim=0)[0], gt_proj_x, reduction='none') * corner_mask_x).mean())
+                dist_y.append((F.l1_loss(image.max(dim=1)[0], gt_proj_y, reduction='none') * corner_mask_y).mean())
 
-            # create gt according to the number config.L
-            N = gt_proj_x.shape[0]
-            corner_mask_x[max(box[0] - config.L, 0): min(box[0] + config.L + 1, N)] = 1.
-            corner_mask_x[max(box[2] - config.L, 0): min(box[2] + config.L + 1, N)] = 1.
-            corner_mask_y[max(box[1] - config.L, 0): min(box[1] + config.L + 1, N)] = 1.
-            corner_mask_y[max(box[3] - config.L, 0): min(box[3] + config.L + 1, N)] = 1.
-            dist_x.append((F.l1_loss(image.max(dim=0)[0], gt_proj_x, reduction='none') * corner_mask_x).mean())
-            dist_y.append((F.l1_loss(image.max(dim=1)[0], gt_proj_y, reduction='none') * corner_mask_y).mean())
+            max_indices_list_bg_all.append(max_indices_list_bg)
+            max_indices_list_fg_all.append(max_indices_list_fg)
+            dist_x_all.append(dist_x)
+            dist_y_all.append(dist_y)
 
-        return max_indices_list_fg, max_indices_list_bg, dist_x, dist_y
+        return max_indices_list_fg_all, max_indices_list_bg_all, dist_x_all, dist_y_all
 
     def _aggregate_and_get_max_attention_per_token(self, attention_store: AttentionStore,
                                                    indices_to_alter: List[int],
-                                                   attention_res: int = 16,
+                                                   ori_height:int=512,
+                                                   ori_width:int=512,
                                                    smooth_attentions: bool = False,
                                                    sigma: float = 0.5,
                                                    kernel_size: int = 3,
                                                    normalize_eot: bool = False,
-                                                   bbox: List[int] = None,
+                                                   bbox: List[List[int]] = None,
                                                    config=None,
+                                                   video_length=None,
                                                    ):
         """ Aggregates the attention for each token and computes the max activation value for each token to alter. """
         attention_maps = aggregate_attention(
             attention_store=attention_store,
-            res=attention_res,
+            res_h = ori_height//32,
+            res_w = ori_width//32,
             from_where=("up", "down", "mid"),
             is_cross=True,
-            select=0)
+            select=0,
+            video_length=video_length,
+        )
+        
         max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._compute_max_attention_per_index(
             attention_maps=attention_maps,
             indices_to_alter=indices_to_alter,
@@ -283,121 +347,136 @@ class BoxDiffPipeline(StableDiffusionPipeline):
         return max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y
 
     @staticmethod
-    def _compute_loss(max_attention_per_index_fg: List[torch.Tensor], max_attention_per_index_bg: List[torch.Tensor],
-                      dist_x: List[torch.Tensor], dist_y: List[torch.Tensor], return_losses: bool = False) -> torch.Tensor:
+    def _compute_loss(max_attention_per_index_fg: List[List[torch.Tensor]], max_attention_per_index_bg: List[List[torch.Tensor]],
+                      dist_x: List[List[torch.Tensor]], dist_y: List[List[torch.Tensor]], return_losses: bool = False) -> List[torch.Tensor]:
         """ Computes the attend-and-excite loss using the maximum attention value for each token. """
-        losses_fg = [max(0, 1. - curr_max) for curr_max in max_attention_per_index_fg]
-        losses_bg = [max(0, curr_max) for curr_max in max_attention_per_index_bg]
-        loss = sum(losses_fg) + sum(losses_bg) + sum(dist_x) + sum(dist_y)
+        losses_fg_all=[]
+        losses_fg_all_max=[]
+        loss_all = []
+        for frame_idx in range(len(max_attention_per_index_bg)):
+            losses_fg = [max(0, 1. - curr_max) for curr_max in max_attention_per_index_fg[frame_idx]]
+            losses_bg = [max(0, curr_max) for curr_max in max_attention_per_index_bg[frame_idx]]
+            loss = sum(losses_fg) + sum(losses_bg) + sum(dist_x[frame_idx]) + sum(dist_y[frame_idx])
+            
+            losses_fg_all.append(losses_fg)
+            losses_fg_all_max.append(max(losses_fg))
+            loss_all.append(loss)
         if return_losses:
-            return max(losses_fg), losses_fg
+            return losses_fg_all_max, losses_fg_all
         else:
-            return max(losses_fg), loss
+            return losses_fg_all_max, loss_all
+        # if return_losses:
+        #     return max(losses_fg), losses_fg
+        # else:
+        #     return max(losses_fg), loss
 
     @staticmethod
-    def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float) -> torch.Tensor:
+    def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float,idx:int) -> torch.Tensor:
         """ Update the latent according to the computed loss. """
-        grad_cond = torch.autograd.grad(loss.requires_grad_(True), [latents], retain_graph=True)[0]
+        retain = idx<latents.shape[2]-1
+        grad_cond = torch.autograd.grad(loss.requires_grad_(True), [latents], retain_graph=retain)[0]
         latents = latents - step_size * grad_cond
         return latents
 
-    def _perform_iterative_refinement_step(self,
-                                           latents: torch.Tensor,
-                                           indices_to_alter: List[int],
-                                           loss_fg: torch.Tensor,
-                                           threshold: float,
-                                           text_embeddings: torch.Tensor,
-                                           text_input,
-                                           attention_store: AttentionStore,
-                                           step_size: float,
-                                           t: int,
-                                           attention_res: int = 16,
-                                           smooth_attentions: bool = True,
-                                           sigma: float = 0.5,
-                                           kernel_size: int = 3,
-                                           max_refinement_steps: int = 20,
-                                           normalize_eot: bool = False,
-                                           bbox: List[int] = None,
-                                           config=None,
-                                           ):
-        """
-        Performs the iterative latent refinement introduced in the paper. Here, we continuously update the latent
-        code according to our loss objective until the given threshold is reached for all tokens.
-        """
-        iteration = 0
-        target_loss = max(0, 1. - threshold)
-        while loss_fg > target_loss:
-            iteration += 1
+    # def _perform_iterative_refinement_step(self,
+    #                                        latents: torch.Tensor,
+    #                                        indices_to_alter: List[int],
+    #                                        loss_fg: torch.Tensor,
+    #                                        threshold: float,
+    #                                        text_embeddings: torch.Tensor,
+    #                                        text_input,
+    #                                        attention_store: AttentionStore,
+    #                                        step_size: float,
+    #                                        t: int,
+    #                                        attention_res: int = 16,
+    #                                        smooth_attentions: bool = True,
+    #                                        sigma: float = 0.5,
+    #                                        kernel_size: int = 3,
+    #                                        max_refinement_steps: int = 20,
+    #                                        normalize_eot: bool = False,
+    #                                        bbox: List[int] = None,
+    #                                        config=None,
+    #                                        ):
+    #     """
+    #     Performs the iterative latent refinement introduced in the paper. Here, we continuously update the latent
+    #     code according to our loss objective until the given threshold is reached for all tokens.
+    #     """
+    #     iteration = 0
+    #     target_loss = max(0, 1. - threshold)
+    #     while loss_fg > target_loss:
+    #         iteration += 1
 
-            latents = latents.clone().detach().requires_grad_(True)
-            noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
-            self.unet.zero_grad()
+    #         latents = latents.clone().detach().requires_grad_(True)
+    #         noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+    #         self.unet.zero_grad()
 
-            # Get max activation value for each subject token
-            max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._aggregate_and_get_max_attention_per_token(
-                attention_store=attention_store,
-                indices_to_alter=indices_to_alter,
-                attention_res=attention_res,
-                smooth_attentions=smooth_attentions,
-                sigma=sigma,
-                kernel_size=kernel_size,
-                normalize_eot=normalize_eot,
-                bbox=bbox,
-                config=config,
-                )
+    #         # Get max activation value for each subject token
+    #         max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._aggregate_and_get_max_attention_per_token(
+    #             attention_store=attention_store,
+    #             indices_to_alter=indices_to_alter,
+    #             attention_res=attention_res,
+    #             smooth_attentions=smooth_attentions,
+    #             sigma=sigma,
+    #             kernel_size=kernel_size,
+    #             normalize_eot=normalize_eot,
+    #             bbox=bbox,
+    #             config=config,
+    #             video_length=num_frames,
+    #             )
 
-            loss_fg, losses_fg = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y, return_losses=True)
+    #         loss_fg, losses_fg = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y, return_losses=True)
+            
+    #         if loss_fg != 0:
+    #             latents = self._update_latent(latents, loss_fg, step_size)
 
-            if loss_fg != 0:
-                latents = self._update_latent(latents, loss_fg, step_size)
+    #         with torch.no_grad():
+    #             noise_pred_uncond = self.unet(latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
+    #             noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
 
-            with torch.no_grad():
-                noise_pred_uncond = self.unet(latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
-                noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+    #         try:
+    #             low_token = np.argmax([l.item() if type(l) != int else l for l in losses_fg])
+    #         except Exception as e:
+    #             print(e)  # catch edge case :)
 
-            try:
-                low_token = np.argmax([l.item() if type(l) != int else l for l in losses_fg])
-            except Exception as e:
-                print(e)  # catch edge case :)
+    #             low_token = np.argmax(losses_fg)
 
-                low_token = np.argmax(losses_fg)
+    #         low_word = self.tokenizer.decode(text_input.input_ids[0][indices_to_alter[low_token]])
+    #         # print(f'\t Try {iteration}. {low_word} has a max attention of {max_attention_per_index_fg[low_token]}')
 
-            low_word = self.tokenizer.decode(text_input.input_ids[0][indices_to_alter[low_token]])
-            # print(f'\t Try {iteration}. {low_word} has a max attention of {max_attention_per_index_fg[low_token]}')
+    #         if iteration >= max_refinement_steps:
+    #             # print(f'\t Exceeded max number of iterations ({max_refinement_steps})! '
+    #             #       f'Finished with a max attention of {max_attention_per_index_fg[low_token]}')
+    #             break
 
-            if iteration >= max_refinement_steps:
-                # print(f'\t Exceeded max number of iterations ({max_refinement_steps})! '
-                #       f'Finished with a max attention of {max_attention_per_index_fg[low_token]}')
-                break
+    #     # Run one more time but don't compute gradients and update the latents.
+    #     # We just need to compute the new loss - the grad update will occur below
+    #     latents = latents.clone().detach().requires_grad_(True)
+    #     noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+    #     self.unet.zero_grad()
 
-        # Run one more time but don't compute gradients and update the latents.
-        # We just need to compute the new loss - the grad update will occur below
-        latents = latents.clone().detach().requires_grad_(True)
-        noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
-        self.unet.zero_grad()
-
-        # Get max activation value for each subject token
-        max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._aggregate_and_get_max_attention_per_token(
-            attention_store=attention_store,
-            indices_to_alter=indices_to_alter,
-            attention_res=attention_res,
-            smooth_attentions=smooth_attentions,
-            sigma=sigma,
-            kernel_size=kernel_size,
-            normalize_eot=normalize_eot,
-            bbox=bbox,
-            config=config,
-        )
-        loss_fg, losses_fg = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y, return_losses=True)
-        # print(f"\t Finished with loss of: {loss_fg}")
-        return loss_fg, latents, max_attention_per_index_fg
+    #     # Get max activation value for each subject token
+    #     max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._aggregate_and_get_max_attention_per_token(
+    #         attention_store=attention_store,
+    #         indices_to_alter=indices_to_alter,
+    #         attention_res=attention_res,
+    #         smooth_attentions=smooth_attentions,
+    #         sigma=sigma,
+    #         kernel_size=kernel_size,
+    #         normalize_eot=normalize_eot,
+    #         bbox=bbox,
+    #         config=config,
+    #         video_length=num_frames
+    #     )
+    #     loss_fg, losses_fg = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y, return_losses=True)
+    #     # print(f"\t Finished with loss of: {loss_fg}")
+    #     return loss_fg, latents, max_attention_per_index_fg
 
     @torch.no_grad()
     def __call__(
             self,
             prompt: Union[str, List[str]],
             attention_store: AttentionStore,
-            indices_to_alter: List[int],
+            indices_to_alter: List[str],
             attention_res: int = 16,
             height: Optional[int] = None,
             width: Optional[int] = None,
@@ -424,8 +503,9 @@ class BoxDiffPipeline(StableDiffusionPipeline):
             sigma: float = 0.5,
             kernel_size: int = 3,
             sd_2_1: bool = False,
-            bbox: List[int] = None,
+            bbox: List[List[int]] = None,
             config = None,
+            num_frames=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -497,12 +577,28 @@ class BoxDiffPipeline(StableDiffusionPipeline):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
-
+        # print(height)
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
         )
-
+        self.res_height=height
+        self.res_width=width
+        _text_inputs = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+        _text_input_ids = _text_inputs.input_ids
+        id_list=[]
+        for item in indices_to_alter:
+            x = self.tokenizer([item],return_tensors="pt").input_ids
+            id = (_text_input_ids[0]==x[0,1]).nonzero().item()
+            id_list.append(id)
+        indices_to_alter = id_list
+        # breakpoint()
         # 2. Define call parameters
         self.prompt = prompt
         if prompt is not None and isinstance(prompt, str):
@@ -538,6 +634,7 @@ class BoxDiffPipeline(StableDiffusionPipeline):
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
+            num_frames,
             height,
             width,
             prompt_embeds.dtype,
@@ -545,7 +642,6 @@ class BoxDiffPipeline(StableDiffusionPipeline):
             generator,
             latents,
         )
-
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -554,16 +650,23 @@ class BoxDiffPipeline(StableDiffusionPipeline):
         if max_iter_to_alter is None:
             max_iter_to_alter = len(self.scheduler.timesteps) + 1
 
+
+        # for unet_n, unet_p in self.unet.named_parameters():
+        #     unet_p.requires_grad_(False)    
+        self.unet.requires_grad_(False)
         # 7. Denoising loop
+        ori_height=height
+        ori_width=width
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
 
                 with torch.enable_grad():
-
+                    # breakpoint()
                     latents = latents.clone().detach().requires_grad_(True)
-
+                    #latens [1, 4, 2, 32, 32], frame 2 h,w 256
                     # Forward pass of denoising with text conditioning
+                    #noise_pred_text [1, 4, 2, 32, 32]
                     noise_pred_text = self.unet(latents, t,
                                                 encoder_hidden_states=prompt_embeds[1].unsqueeze(0), cross_attention_kwargs=cross_attention_kwargs).sample
                     self.unet.zero_grad()
@@ -572,88 +675,122 @@ class BoxDiffPipeline(StableDiffusionPipeline):
                     max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y = self._aggregate_and_get_max_attention_per_token(
                         attention_store=attention_store,
                         indices_to_alter=indices_to_alter,
-                        attention_res=attention_res,
+                        ori_height=ori_height,
+                        ori_width=ori_width,
                         smooth_attentions=smooth_attentions,
                         sigma=sigma,
                         kernel_size=kernel_size,
                         normalize_eot=sd_2_1,
                         bbox=bbox,
                         config=config,
+                        video_length=num_frames
                     )
-
                     if not run_standard_sd:
 
-                        loss_fg, loss = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y)
+                        # loss_fg, loss = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y)
 
-                        # Refinement from attend-and-excite (not necessary)
-                        if i in thresholds.keys() and loss_fg > 1. - thresholds[i] and config.refine:
-                            del noise_pred_text
-                            torch.cuda.empty_cache()
-                            loss_fg, latents, max_attention_per_index_fg = self._perform_iterative_refinement_step(
-                                latents=latents,
-                                indices_to_alter=indices_to_alter,
-                                loss_fg=loss_fg,
-                                threshold=thresholds[i],
-                                text_embeddings=prompt_embeds,
-                                text_input=text_inputs,
-                                attention_store=attention_store,
-                                step_size=scale_factor * np.sqrt(scale_range[i]),
-                                t=t,
-                                attention_res=attention_res,
-                                smooth_attentions=smooth_attentions,
-                                sigma=sigma,
-                                kernel_size=kernel_size,
-                                normalize_eot=sd_2_1,
-                                bbox=bbox,
-                                config=config,
-                            )
+                        # # Refinement from attend-and-excite (not necessary)
+                        # if i in thresholds.keys() and loss_fg > 1. - thresholds[i] and config.refine:
+                        #     del noise_pred_text
+                        #     torch.cuda.empty_cache()
+                        #     loss_fg, latents, max_attention_per_index_fg = self._perform_iterative_refinement_step(
+                        #         latents=latents,
+                        #         indices_to_alter=indices_to_alter,
+                        #         loss_fg=loss_fg,
+                        #         threshold=thresholds[i],
+                        #         text_embeddings=prompt_embeds,
+                        #         text_input=text_inputs,
+                        #         attention_store=attention_store,
+                        #         step_size=scale_factor * np.sqrt(scale_range[i]),
+                        #         t=t,
+                        #         attention_res=attention_res,
+                        #         smooth_attentions=smooth_attentions,
+                        #         sigma=sigma,
+                        #         kernel_size=kernel_size,
+                        #         normalize_eot=sd_2_1,
+                        #         bbox=bbox,
+                        #         config=config,
+                        #     )
 
                         # Perform gradient update
+                        #max_iter_to_alter=25
                         if i < max_iter_to_alter:
-                            _, loss = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y)
+                            _, loss_all = self._compute_loss(max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y)
+                            loss = sum(loss_all)
                             if loss != 0:
-                                latents = self._update_latent(latents=latents, loss=loss,
-                                                              step_size=scale_factor * np.sqrt(scale_range[i]))
-
+                                latents = self._update_latent(latents=latents, loss=loss, step_size=scale_factor * np.sqrt(scale_range[i]),idx=0)
+                            # for idx,loss in enumerate(loss_all):
+                                # x = self._update_latent(latents=latents, loss=loss, step_size=scale_factor * np.sqrt(scale_range[i]),idx=idx)
+                                # tmp.append(x)
+                            # tmp = torch.cat(tmp,dim=2)
+                            # latents = tmp.clone()
+                            del noise_pred_text
+                            torch.cuda.empty_cache()
+                            attention_store.reset()
                             # print(f'Iteration {i} | Loss: {loss:0.4f}')
-
+                # breakpoint()
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                ).sample
-
+                with torch.no_grad():
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    ).sample
+                    
+                attention_maps = aggregate_attention(
+                    attention_store=attention_store,
+                    res_h = ori_height//32,
+                    res_w = ori_width//32,
+                    from_where=("up", "down"),
+                    is_cross=True,
+                    select=0,
+                    video_length=num_frames,
+                )
+                self.save_cross_attention_vis(
+                    prompt=prompt,
+                    attention_maps=attention_maps,
+                    path = f"outputs/{i}.png"
+                )
+                attention_store.reset()
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                # reshape latents
+                bsz, channel, frames, width, height = latents.shape
+                latents = latents.permute(0, 2, 1, 3, 4).reshape(bsz * frames, channel, width, height)
+                noise_pred = noise_pred.permute(0, 2, 1, 3, 4).reshape(bsz * frames, channel, width, height)
+
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
+                # reshape latents back
+                latents = latents[None, :].reshape(bsz, frames, channel, width, height).permute(0, 2, 1, 3, 4)
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
+        if output_type == "latent":
+            return TextToVideoSDPipelineOutput(frames=latents)
 
-        # 8. Post-processing
-        image = self.decode_latents(latents)
+        video_tensor = self.decode_latents(latents)
 
-        # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        if output_type == "pt":
+            video = video_tensor
+        else:
+            video = tensor2vid(video_tensor)
 
-        # 10. Convert to PIL
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
+        # Offload all models
+        self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, has_nsfw_concept)
+            return (video,)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return TextToVideoSDPipelineOutput(frames=video)

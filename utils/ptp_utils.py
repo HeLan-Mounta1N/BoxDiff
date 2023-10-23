@@ -7,7 +7,7 @@ from IPython.display import display
 from PIL import Image
 from typing import Union, Tuple, List
 
-from diffusers.models.cross_attention import CrossAttention
+from diffusers.models.attention_processor import Attention
 
 def text_under_image(image: np.ndarray, text: str, text_color: Tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
     h, w, c = image.shape
@@ -61,7 +61,7 @@ class AttendExciteCrossAttnProcessor:
         self.attnstore = attnstore
         self.place_in_unet = place_in_unet
 
-    def __call__(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None):
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size=1)
         query = attn.to_q(hidden_states)
@@ -95,7 +95,11 @@ def register_attention_control(model, controller):
     attn_procs = {}
     cross_att_count = 0
     for name in model.unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else model.unet.config.cross_attention_dim
+        cross_attention_dim =(
+            None 
+            if name.endswith("attn1.processor") or "temp" in name or "transformer_in" in name
+            else model.unet.config.cross_attention_dim
+        )
         if name.startswith("mid_block"):
             hidden_size = model.unet.config.block_out_channels[-1]
             place_in_unet = "mid"
@@ -107,6 +111,8 @@ def register_attention_control(model, controller):
             block_id = int(name[len("down_blocks.")])
             hidden_size = model.unet.config.block_out_channels[block_id]
             place_in_unet = "down"
+        elif name.startswith("transformer_in"):
+            place_in_unet = "temp"
         else:
             continue
 
@@ -163,11 +169,11 @@ class AttentionStore(AttentionControl):
     @staticmethod
     def get_empty_store():
         return {"down_cross": [], "mid_cross": [], "up_cross": [],
-                "down_self": [], "mid_self": [], "up_self": []}
+                "down_self": [], "mid_self": [], "up_self": [],"temp_self":[]}
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+        if attn.shape[1] <= self.height*self.width//(16*16):  # avoid memory overhead
             self.step_store[key].append(attn)
         return attn
 
@@ -199,7 +205,7 @@ class AttentionStore(AttentionControl):
         self.attention_store = {}
         self.global_store = {}
 
-    def __init__(self, save_global_store=False):
+    def __init__(self,height,width, save_global_store=False):
         '''
         Initialize an empty AttentionStore
         :param step_index: used to visualize only a specific step in the diffusion process
@@ -211,23 +217,27 @@ class AttentionStore(AttentionControl):
         self.global_store = {}
         self.curr_step_index = 0
         self.num_uncond_att_layers = 0
+        self.height=height
+        self.width=width
 
 
 def aggregate_attention(attention_store: AttentionStore,
-                        res: int,
+                        res_h: int,
+                        res_w: int,
                         from_where: List[str],
                         is_cross: bool,
-                        select: int) -> torch.Tensor:
+                        select: int,
+                        video_length: int) -> torch.Tensor:
     """ Aggregates the attention across the different layers and heads at the specified resolution. """
     out = []
     attention_maps = attention_store.get_average_attention()
 
-    num_pixels = res ** 2
+    num_pixels = res_h*res_w
     for location in from_where:
         for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
             if item.shape[1] == num_pixels:
-                cross_maps = item.reshape(1, -1, res, res, item.shape[-1])[select]
+                cross_maps = item.reshape(1, video_length, -1, res_h, res_w, item.shape[-1])[select]
                 out.append(cross_maps)
-    out = torch.cat(out, dim=0)
-    out = out.sum(0) / out.shape[0]
+    out = torch.cat(out, dim=1)
+    out = out.sum(1) / out.shape[1]
     return out

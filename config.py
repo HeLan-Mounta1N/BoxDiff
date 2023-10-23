@@ -10,9 +10,9 @@ class RunConfig:
     # Whether to use Stable Diffusion v2.1
     sd_2_1: bool = False
     # Which token indices to alter with attend-and-excite
-    token_indices: List[int] = None
+    token_indices: List[str] = None
     # Which random seeds to use when generating
-    seeds: List[int] = field(default_factory=lambda: [42])
+    seeds: List[int] = field(default_factory=lambda: [5])
     # Path to save all outputs to
     output_path: Path = Path('./outputs')
     # Number of denoising steps
@@ -39,14 +39,14 @@ class RunConfig:
     kernel_size: int = 3
     # Whether to save cross attention maps for the final results
     save_cross_attention_maps: bool = False
-
+    num_frames: int = 6
     # BoxDiff
     bbox: List[list] = field(default_factory=lambda: [[], []])
     color: List[str] = field(default_factory=lambda: ['blue', 'red', 'purple', 'orange', 'green', 'yellow', 'black'])
     P: float = 0.2
     # number of pixels around the corner to be selected
     L: int = 1
-    refine: bool = True
+    refine: bool = False
     gligen_phrases: List[str] = field(default_factory=lambda: ['', ''])
     n_splits: int = 4
     which_one: int = 1

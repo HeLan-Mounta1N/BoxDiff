@@ -12,7 +12,8 @@ from utils.ptp_utils import AttentionStore
 
 import numpy as np
 from utils.drawer import draw_rectangle, DashedImageDraw
-
+import imageio
+from diffusers import DPMSolverMultistepInverseScheduler
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -23,11 +24,11 @@ def load_model(config: RunConfig):
     if config.sd_2_1:
         stable_diffusion_version = "stabilityai/stable-diffusion-2-1-base"
     else:
-        stable_diffusion_version = "CompVis/stable-diffusion-v1-4"
+        stable_diffusion_version = "/home/zideliu/boxdiff/models/zeroscope_v2_576w"
         # If you cannot access the huggingface on your server, you can use the local prepared one.
         # stable_diffusion_version = "../../packages/huggingface/hub/stable-diffusion-v1-4"
-    stable = BoxDiffPipeline.from_pretrained(stable_diffusion_version).to(device)
-
+    stable = BoxDiffPipeline.from_pretrained(stable_diffusion_version, torch_dtype=torch.float16).to(device)
+    # stable.scheduler = DPMSolverMultistepInverseScheduler.from_config(stable.scheduler.config)
     return stable
 
 
@@ -67,47 +68,48 @@ def run_on_prompt(prompt: List[str],
                     sigma=config.sigma,
                     kernel_size=config.kernel_size,
                     sd_2_1=config.sd_2_1,
+                    num_frames=12,
                     bbox=config.bbox,
+                    height=512,
+                    width=512,
                     config=config)
-    image = outputs.images[0]
-    return image
+    frames = outputs.frames
+    return frames
 
 
 @pyrallis.wrap()
 def main(config: RunConfig):
+    print("bbox shape:", len(config.bbox), '\t', len(config.bbox[0]))
     stable = load_model(config)
     token_indices = get_indices_to_alter(stable, config.prompt) if config.token_indices is None else config.token_indices
-
-    if len(config.bbox[0]) == 0:
-        config.bbox = draw_rectangle()
-
-    images = []
+   
     for seed in config.seeds:
         print(f"Current seed is : {seed}")
         g = torch.Generator('cuda').manual_seed(seed)
-        controller = AttentionStore()
-        image = run_on_prompt(prompt=config.prompt,
-                              model=stable,
-                              controller=controller,
-                              token_indices=token_indices,
-                              seed=g,
-                              config=config)
+        controller = AttentionStore(height=512,width=512)
+    # stable.enable_model_cpu_offload()
+        # stable.enable_vae_slicing()
+        frames = run_on_prompt(prompt=config.prompt,
+                                model=stable,
+                                controller=controller,
+                                token_indices=token_indices,
+                                seed=g,
+                                config=config)
         prompt_output_path = config.output_path / config.prompt[:100]
         prompt_output_path.mkdir(exist_ok=True, parents=True)
-        image.save(prompt_output_path / f'{seed}.png')
-        images.append(image)
-
-        canvas = Image.fromarray(np.zeros((image.size[0], image.size[0], 3), dtype=np.uint8) + 220)
-        draw = DashedImageDraw(canvas)
-
-        for i in range(len(config.bbox)):
-            x1, y1, x2, y2 = config.bbox[i]
-            draw.dashed_rectangle([(x1, y1), (x2, y2)], dash=(5, 5), outline=config.color[i], width=5)
-        canvas.save(prompt_output_path / f'{seed}_canvas.png')
-
-    # save a grid of results across all seeds
-    joined_image = vis_utils.get_image_grid(images)
-    joined_image.save(config.output_path / f'{config.prompt}.png')
+        canvas_list = []
+        for idx in range(len(config.bbox[0])):
+            canvas = Image.fromarray(np.zeros((512, 512, 3), dtype=np.uint8) + 220)
+            draw = DashedImageDraw(canvas)
+            for i in range(len(config.bbox)):
+                x1, y1, x2, y2 = config.bbox[i][idx]
+                x2 = x1 + x2
+                y2 = y1 + y2
+                draw.dashed_rectangle([(x1, y1), (x2, y2)], dash=(5, 5), outline=config.color[i], width=5)
+            canvas_list.append(np.array(canvas))
+            # canvas.save(prompt_output_path / f'{seed}_canvas.png')
+        imageio.mimsave(prompt_output_path / f'{seed}.gif',frames, loop=10)
+        imageio.mimsave(prompt_output_path / f'{seed}_canvas.gif', canvas_list, loop=10)
 
 
 if __name__ == '__main__':
